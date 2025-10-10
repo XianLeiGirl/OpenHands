@@ -219,6 +219,157 @@ class AgentController:
         if self.delegate is not None:
             return False
 
+        if isinstance(event, Action):
+            if isinstance(event, MessageAction) and event.source == EventSource.USER:
+                return True
+            if isinstance(event, MessageAction) and self.get_agent_state() != AgentState.AWAITING_USER_INPUT: # LOOK
+                return True
+            if isinstance(event, AgentDelegateAction):
+                return True
+            if isinstance(event, CondensationRequestAction):
+                return True
+            return False   
+
+        if isinstance(event, Observation):
+            if (
+                isinstance(event, NullObservation)
+                and event.cause is not None
+                and event.cause > 0
+            ):
+                return True
+            if isinstance(event, AgentStateChangedObservation) or isinstance(event, NullObservation):
+                return False
+            return True
+        return False                 
+
+    def on_event(self, event: Event) -> None:
+        if self.delegate is not None:
+            delegate_state = self.delegate.get_agent_state()
+            if (
+                delegate_state
+                not in (
+                    AgentState.FINISHED,
+                    AgentState.ERROR,
+                    AgentState.REJECTED,
+                )
+                or 'RuntimeError: Agent reached maximum iteration.' # LOOK
+                in self.delegate.state.last_error
+                or 'RuntimeError: Agent reached maximum budget for conversation' # LOOK
+                in self.delegate.state.last_error
+            ):
+                asyncio.get_event_loop().run_until_complete(
+                    self.delegate._on_event(event)
+                )
+                return 
+            else:
+                self.end_delegate()
+                return
+
+        asyncio.get_event_loop().run_until_complete(self._on_event(event))            
+
+    async def _on_event(self, event: Event) -> None:
+        if hasattr(event, 'hidden') and event.hidden:
+            return
+        self.state_tracker.add_history(event)
+
+        if isinstance(event, Action):
+            await self._handle_action(event)
+        elif isinstance(event, Observation):
+            await self._handle_observation(event)
+
+        should_step = self.should_step(event)    
+        if should_step:
+            self.log(
+                'debug',
+                f'Stepping agent after event: {type(event).__name__}',
+                extra={'msg_type': 'STEPPING_AGENT'}
+            )
+            await self._step_with_exception_handling()
+        elif isinstance(event, MessageAction) and event.source == EventSource.USER:
+            self.log(
+                'warning',
+                f'Not stepping agent after user message. Current state: {self.get_agent_state()}',
+                extra={'msg_type': 'NOT_STEPPING_AGENT_AFTER_USER_MESSAGE'}
+            )  
+
+    async def _handle_action(self, action: Action) -> None:
+        if isinstance(action, ChangeAgentStateAction):
+            await self.set_agent_state_to(action.agent_state)
+        elif isinstance(action, MessageAction):
+            await self._handle_message_action(action)  
+        elif isinstance(action, AgentDelegateAction):
+            await self.start_delegate(action)
+            assert self.delegate is not None
+            if 'task' in action.inputs:
+                self.event_stream.add_event(
+                    MessageAction(content='TASK: ' + action.inputs['task']),
+                    EventSource.USER,
+                )
+                await self.delegate.set_agent_state_to(AgentState.RUNNING)  
+                return
+        elif isinstance(action, AgentFinishAction):
+            self.state.outputs = action.outputs
+            await self.set_agent_state_to(AgentState.FINISHED)
+        elif isinstance(action, AgentRejectAction):
+            self.state.outputs = action.outputs
+            await self.set_agent_state_to(AgentState.REJECTED)
+
+    async def _handle_observation(self, observation: Observation) -> None:
+        observation_to_print = copy.deepcopy(observation)
+        if len(observation_to_print.content) > self.agent.llm.config.max_message_chars:
+            observation_to_print.content = truncate_content(
+                observation_to_print.content, self.agent.llm.config.max_message_chars
+            )
+        log_level = 'info' if os.getenv('LOG_ALL_EVENTS') in ('true', '1') else 'debug'
+        self.log(
+            log_level, str(observation_to_print), extra={'msg_type': 'OBSERVATION'}
+        )
+
+        if self._pending_action and self._pending_action.id == observation.cause:
+            if self.state.agent_state == AgentState.AWAITING_USER_CONFIRMATION: # LOOK
+                return
+            self._pending_action = None
+
+            if self.state.agent_state == AgentState.USER_CONFIRMED:
+                await self.set_agent_state_to(AgentState.RUNNING) # LOOK
+            if self.state.agent_state == AgentState.USER_REJECTED:
+                await self.set_agent_state_to(AgentState.AWAITING_USER_INPUT)
+            return         
+
+    async def _handle_message_action(self, action: MessageAction) -> None:
+        if action.source == EventSource.USER:
+            log_level = 'info' if os.geteng('LOG_ALL_EVENTS') in ('true', '1') else 'debug'
+            self.log(
+                log_level,
+                str(action),
+                extra={'msg_type': 'ACTION', 'event_source': EventSource.USER},
+            )
+
+            first_user_message = self._first_user_message # LOOK 一轮的第一个消息？
+            is_first_user_message = (
+                action.id == first_user_message.id if first_user_message else False
+            )
+            recall_type = (
+                RecallType.WORKSPACE_CONTEXT
+                if is_first_user_message 
+                else RecallType.KNOWLEDGE
+            )
+
+            recall_action = RecallAction(query=action.content, recall_type=recall_type)
+            self._pending_action = recall_action
+
+            self.event_stream.add_event(recall_action, EventSource.USER) # LOOK _on_event没有RecallAction这种Action处理?
+
+            if self.get_agent_state() != AgentState.RUNNING:
+                await self.set_agent_state_to(AgentState.RUNNING)
+        elif action.source == EventSource.AGENT:
+            if action.wait_for_response:
+                await self.set_agent_state_to(AgentState.AWAITING_USER_INPUT)
+
+    def _reset(self) -> None:
+                            
+
+
 
     def run(self):
         pass
