@@ -1,3 +1,12 @@
+import asyncio
+import threading
+import queue
+from typing import Any, Callable
+import json
+from datetime import datetime
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+
 from openhands.storage.locations import get_conversation_events_dir
 from openhands.storage.files import FileStore
 from openhands.events.event_store import EventStore
@@ -14,9 +23,9 @@ class EventStreamSubscriber(str, Enum):
     TEST = 'test'
 
 class EventStream(EventStore):
-    secrets: dict[str, str]
+    secrets: dict[str, str] # LOOK: 有啥
     _subscribers: dict[str, dict[str, Callable]]
-    _lock: threading.Lock
+    _lock: threading.Lock # LOOK: 线程锁？
     _queue: queue.Queue[Event]
     _queue_thread: threading.Thread
     _queue_loop: asyncio.AbstractEventLoop | None
@@ -45,6 +54,20 @@ class EventStream(EventStore):
         if subscriber_id not in self._thread_loops:
             self._thread_loops[subscriber_id] = {}
         self._thread_loops[subscriber_id][callback_id] = loop
+
+    def close(self) -> None:
+        self._stop_flag.set()
+        if self._queue_thread.is_alive():
+            self._queue_thread.join()
+
+        subscriber_ids = list(self._subscribers.keys())
+        for subscriber_id in subscriber_ids:
+            callback_ids = list(self._subscribers[subscriber_id].keys())
+            for callback_id in callback_ids:
+                self._clean_up_subscriber(subscriber_id, callback_id)
+
+        while not self._queue.empty():
+            self._queue.get()        
 
     def _clean_up_subscriber(self, subscriber_id: str, callback_id: str) -> None:
         if subscriber_id not in self._subscribers:
@@ -115,6 +138,85 @@ class EventStream(EventStore):
             return
 
         self._clean_up_subscriber(subscriber_id, callback_id)
+
+    def add_event(self, event: Event, source: EventSource) -> None:
+        if event.id != Event.INVALID_ID:
+            raise ValueError(
+                f'Event already has an ID:{event.id}. It was probably added back to the EventStream from inside a handler, triggering a loop.'
+            )
+        event._timestamp = datetime.now().isoformat()
+        event._source = source
+        with self._lock:
+            event._id = self.cur_id
+            self.cur_id += 1
+
+            current_write_page = self._write_page_cache
+
+            data = event_to_dict(event)
+            data = self._replace_secrets(data)
+            event = event_from_dict(data) # LOOK: 少了些东西？
+            current_write_page.append(data)
+
+            if len(current_write_page) >= self.cache_size:
+                self._write_page_cache = []
+
+        if event.id is not None:
+            event_json = json.dumps(event)
+            filename = self._get_filename_for_id(event.id, self.user_id)
+            if len(event_json) > 1_000_000:
+                logger.warning(
+                    f'Saving event JSON over 1MB: {len(event_json):,} bytes, filename: {filename}',
+                    extra={
+                        'user_id': self.user_id,
+                        'session_id': self.sid,
+                        'size': len(event_json),
+                    },
+                )
+            self.file_store.write(filename, event_json)
+
+            self._store_cache_page(current_write_page)   
+
+        self._queue.put(event)
+
+    def _store_cache_page(self, current_write_page: list[dict]):
+        if len(current_write_page) < self.cache_size:
+            return
+        start = current_write_page[0]["id"]
+        end = start + self.cache_size
+        contents = json.dumps(current_write_page)
+        cache_filename = self._get_filename_for_cache(start, end)
+        self.file_store.write(cache_filename, contents)           
+
+    def set_secrets(self, secrets: dict[str, str]) -> None:
+        self.secrets = secrets.copy()
+
+    def update_secrets(self, secrets: dict[str, str]) -> None:
+        self.secrets.update(secrets)    
+
+    def _replace_secrets(
+        self, data: dict[str, Any], is_top_level: bool = True
+    ) -> dict[str, Any]:
+        TOP_LEVEL_PROTECTED_FIELDS = {
+            'timestamp',
+            'id',
+            'source',
+            'cause',
+            'action',
+            'observation',
+            'message',
+        }
+
+        for key in data:
+            if is_top_level and key in TOP_LEVEL_PROTECTED_FIELDS:
+                continue
+            elif isinstance(data[key], dict):
+                data[key] = self._replace_secrets(data[key], is_top_level=False)
+            elif isinstance(data[key], str):
+                for secret in self.secrets.values():
+                    data[key] = data[key].replace(secret, '<secret_hidden>')
+
+        return data
+
 
     def _run_queue_loop(self) -> None:
         self._queue_loop = asyncio.new_event_loop()
