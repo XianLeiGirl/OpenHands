@@ -1,6 +1,7 @@
 from dataclasses import asdict
 from datetime import datetime
 from enum import Enum
+from webbrowser import get
 
 from pydantic import BaseModel
 
@@ -17,6 +18,57 @@ TOP_KEYS = [
     'tool_call_metadata',
     'llm_metrics',
 ]
+
+UNDERSCORE_KEYS = [
+    'id',
+    'timestamp',
+    'source',
+    'cause',
+    'tool_call_metadata',
+    'llm_metrics',
+]
+
+def event_from_dict(data: dict[str, Any]) -> 'Event':
+    evt: Event
+    if 'action' in data:
+        evt = action_from_dict(data)
+    elif 'observation' in data:
+        evt = observation_from_dict(data)
+    else:
+        raise ValueError(f'Unknown event type: {data}')
+    for key in UNDERSCORE_KEYS:
+        if key in data:
+            value = data[key]
+            if key == 'timestamp' and isinstance(value, datetime):
+                value = value.isoformat()
+            if key == 'source':
+                value = EventSource(value)    
+            if key == 'tool_call_metadata':
+                value = ToolCallMetadata(**value)
+            if key == 'llm_metrics':
+                metrics = Metrics()
+                if isinstance(value, dict):
+                    metrics.accumulated_cost = value.get('accumulated_cost', 0)
+                    metrics.max_budget_per_task = value.get('max_budget_per_task', 0)
+                    for cost in value.get('costs', []):
+                        metrics._costs.append(Cost(**cost))
+                    metrics.response_latencies = [
+                        ResponseLatency(**latency) for latency in value.get('response_latencies', [])
+                    ]    
+                    metrics.token_usages = [
+                        TokenUsage(**usage) for usage in value.get('token_usages', [])
+                    ]
+                    if 'accumulated_token_usage' in value:
+                        metrics.accumulated_token_usage = TokenUsage(
+                            **value.get('accumulated_token_usage', {})
+                        )
+                value = metrics
+            setattr(evt, '_' + key, value)  
+    return evt                  
+
+
+
+
 
 def event_to_dict(event: 'Event') -> dict: # LOOK: Event的attr键是怎么从属性转过来的？recall_type
     props = asdict(event)
@@ -69,23 +121,3 @@ def _convert_pydantic_to_dict(obj: BaseModel | dict) -> dict:
     if isinstance(obj, BaseModel):
         return obj.model_dump()
     return obj    
-
-
-###########pratice asdict############
-def asdict(obj, *, dict_factory: dict):
-    if not _is_dataclass_instance(obj):
-        raise TypeError("asdict() should be called on dataclass instances")
-    return _asdict_inner(obj, dict_factory)    
-
-_FIELDS = '__dataclass_fields__'
-_ATOMIC_TYPES = frozenset({
-    types.NoneType,
-    bool, 
-    
-})
-
-def _is_dataclass_instance(obj):
-    return hasattr(type(obj), _FIELDS)
-
-def _asdict_inner(obj, dict_factory):
-    if type(obj) in 
